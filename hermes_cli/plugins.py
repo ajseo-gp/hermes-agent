@@ -185,11 +185,17 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # pre_exec: an opt-in veto on command execution, fired from the terminal tool's pre-execution
+    # guard chain AFTER every built-in guard and BEFORE the approval gate. Kwargs: command, env_type,
+    # cwd, workdir, session_key. Return None or {"action": "block", "reason": <non-empty str>} to
+    # refuse; {"action": "allow"} is advisory and overrides nothing. Fails open — see
+    # tools/pre_exec_hook.py for the full contract.
+    "pre_exec",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification", "pre_exec"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()

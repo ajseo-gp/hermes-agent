@@ -439,6 +439,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | Hook | Category | Exact timing and return behavior | Explicit payload fields | Privacy / sensitivity |
 |---|---|---|---|---|
 | [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; first valid `block` or `approve` directive wins, and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
+| [`pre_exec`](#pre_exec) | Directive/control | Inside the terminal tool's pre-execution guard chain, after every built-in guard and before the approval gate; the first valid `block` directive refuses the command. Python plugins only. | `command`, `env_type`, `cwd`, `workdir`, `session_key` | The raw command line may contain paths, user content, or secrets. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
@@ -601,6 +602,75 @@ def warn_dangerous(tool_name, **kwargs):
 
 def register(ctx):
     ctx.register_hook("pre_tool_call", warn_dangerous)
+```
+
+---
+
+### `pre_exec`
+
+An **opt-in veto on command execution**, fired from the terminal tool's pre-execution guard chain. Hermes already refuses commands with built-in, host-owned guards (the supervised-gateway lifecycle block, the workdir allowlist, the Windows self-repo guard); `pre_exec` is the seam for preconditions core cannot know about, so a deployment can express one without forking the guard chain.
+
+**Callback signature:**
+
+```python
+def my_callback(command: str, env_type: str, cwd: str, workdir: str | None, session_key: str, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `command` | `str` | The command line about to run, verbatim |
+| `env_type` | `str` | Terminal backend (`"local"`, `"docker"`, `"ssh"`, …) |
+| `cwd` | `str` | The backend's working directory |
+| `workdir` | `str \| None` | Per-command working directory override, when the caller passed one |
+| `session_key` | `str` | Session identifier used for cwd records; empty string when unset |
+
+These are exactly the fields the guard chain already holds — nothing further is resolved on the plugin's behalf, and there is no configuration key or environment variable that turns the hook on. Registering a callback is the only way to enable it.
+
+**Fires:** in `tools/terminal_tool.py`, inside `_pre_exec_block()`, **after** every built-in guard and **before** the approval gate. Running last is deliberate: a plugin never sees a command core already refused, so it can only ever narrow what runs. Running before approval means a command the hook will refuse never prompts a human.
+
+**Return value — refuse the command:**
+
+```python
+return {"action": "block", "reason": "Reason the command was refused"}
+```
+
+`reason` must be a non-empty string; it is rendered into the blocked tool result (`status: "blocked"`, `exit_code: 1`) that the operator and the model see, truncated to 2000 characters. A `block` without a usable reason is ignored, so a malformed directive can never produce an unexplained refusal.
+
+**Return value — allow:**
+
+```python
+return {"action": "allow"}
+```
+
+`allow` is **advisory**. It does not override a built-in guard (the hook runs after them), and it does not veto another callback's `block`. Every registered callback runs and the first valid `block` wins.
+
+Any other return — `None`, a non-dict, an unknown action — is non-applicable and ignored.
+
+**Failure behavior:** the hook **fails open**. A callback that raises is isolated by `invoke_hook` and yields no verdict, so the command proceeds exactly as if no plugin were registered — a broken plugin degrades to absent rather than bricking every command on the host. A plugin that needs strictness owns it: catch your own errors and return an explicit `block`.
+
+**Python plugins only.** The shell-hook response parser has no channel for this directive, so a shell registration on `pre_exec` is refused with a warning rather than having its output silently ignored.
+
+**Use cases:** deployment-specific preconditions, environment or lease checks before mutating commands, per-session policy that the built-in guards do not model.
+
+**Example — refuse mutating commands while a precondition is unmet:**
+
+```python
+import shlex
+
+BLOCKED_VERBS = {"push", "reset", "clean"}
+
+def require_precondition(command, env_type, cwd, workdir, session_key, **kwargs):
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None  # unparseable: let the built-in guards and approval gate decide
+    if parts[:1] == ["git"] and set(parts[1:2]) & BLOCKED_VERBS:
+        if not precondition_met(session_key):        # your own check
+            return {"action": "block", "reason": "Precondition not met for this session."}
+    return {"action": "allow"}
+
+def register(ctx):
+    ctx.register_hook("pre_exec", require_precondition)
 ```
 
 ---

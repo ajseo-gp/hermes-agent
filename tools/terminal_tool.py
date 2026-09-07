@@ -732,6 +732,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     return normalized.startswith("gh auth login") and "--with-token" in normalized
 
 
+from tools.pre_exec_hook import resolve_pre_exec
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, self_repo_block,
@@ -1119,7 +1120,11 @@ def _pre_exec_block(
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the self-repo guard (local only).
+    then the dangerous-workdir check, then the self-repo guard (local only),
+    and last the opt-in ``pre_exec`` plugin hook. The hook runs after every
+    built-in guard on purpose — a plugin never sees a command core already
+    refused, so it can only narrow what runs, never widen it. With no callback
+    registered the hook is a no-op (tools/pre_exec_hook.py).
     """
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
@@ -1136,6 +1141,14 @@ def _pre_exec_block(
         blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
         if blocked:
             raise _Rejected(blocked)
+    decision = resolve_pre_exec(
+        command=command, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+    )
+    if decision.blocked:
+        logger.warning("Blocked by pre_exec hook: %s (command: %s)",
+                       decision.reason, _safe_command_preview(command))
+        raise _Rejected(_error_json(
+            f"Blocked by pre_exec hook: {decision.reason}", exit_code=1, status="blocked"))
 
 
 _PTY_DISABLED_REASON = (
